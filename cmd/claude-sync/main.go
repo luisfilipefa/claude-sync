@@ -31,8 +31,10 @@ import (
 )
 
 var (
-	version = "dev" // Set via ldflags at build time: -ldflags "-X main.version=x.x.x"
-	quiet   bool
+	version      = "dev" // Set via ldflags at build time: -ldflags "-X main.version=x.x.x"
+	quiet        bool
+	instanceName string
+	claudeDir    string
 )
 
 // ANSI color codes
@@ -45,6 +47,48 @@ const (
 	colorYellow = "\033[33m"
 )
 
+// resolveInstance derives instance name and claude dir from flags and env
+func resolveInstance() (string, string) {
+	// If explicit flags are provided, use them
+	if instanceName != "" {
+		// Map instance name to claude dir
+		home, _ := os.UserHomeDir()
+		return instanceName, filepath.Join(home, ".claude-"+instanceName)
+	}
+
+	if claudeDir != "" {
+		// Derive instance from directory basename
+		base := filepath.Base(claudeDir)
+		derivedName := deriveInstanceName(base)
+		return derivedName, claudeDir
+	}
+
+	// Fall back to CLAUDE_CONFIG_DIR env var
+	if envPath := os.Getenv("CLAUDE_CONFIG_DIR"); envPath != "" {
+		base := filepath.Base(envPath)
+		derivedName := deriveInstanceName(base)
+		return derivedName, envPath
+	}
+
+	// Default: no instance (uses ~/.claude and ~/.claude-sync)
+	return "", ""
+}
+
+// deriveInstanceName extracts instance name from a claude dir basename
+// Examples: ".claude-personal" -> "personal", ".claude-zig" -> "zig", ".claude" -> ""
+func deriveInstanceName(basename string) string {
+	// If it's ".claude-<name>", extract <name>
+	if strings.HasPrefix(basename, ".claude-") {
+		return strings.TrimPrefix(basename, ".claude-")
+	}
+	// If it's just ".claude", return empty (default instance)
+	if basename == ".claude" {
+		return ""
+	}
+	// Otherwise strip leading dot
+	return strings.TrimPrefix(basename, ".")
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:     "claude-sync",
@@ -54,6 +98,8 @@ func main() {
 	}
 
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "Suppress output")
+	rootCmd.PersistentFlags().StringVarP(&instanceName, "instance", "i", "", "Instance name (e.g. personal, zig)")
+	rootCmd.PersistentFlags().StringVar(&claudeDir, "claude-dir", "", "Explicit path to Claude config dir")
 
 	rootCmd.AddCommand(
 		initCmd(),
@@ -140,16 +186,20 @@ Examples:
 			// Show banner
 			printBanner()
 
+			// Resolve instance
+			inst, explicitClaudeDir := resolveInstance()
 			ctx := context.Background()
-			keyPath := config.AgeKeyFilePath()
+			keyPath := config.AgeKeyFilePathForInstance(inst)
+
+			fmt.Printf("  %sInstance:%s %s\n", colorDim, colorReset, keyPath)
 
 			// Special case: --passphrase with existing config = just regenerate key
-			if usePassphrase && config.Exists() && !force {
-				return initPassphraseOnly(ctx, keyPath)
+			if usePassphrase && config.ExistsForInstance(inst) && !force {
+				return initPassphraseOnly(ctx, keyPath, inst, explicitClaudeDir)
 			}
 
 			// Normal flow: full setup
-			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile, usePassphrase, force)
+			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile, usePassphrase, force, inst, explicitClaudeDir)
 		},
 	}
 
@@ -176,8 +226,8 @@ Examples:
 
 // initPassphraseOnly handles the case where user just wants to re-enter passphrase
 // keeping existing storage configuration
-func initPassphraseOnly(ctx context.Context, keyPath string) error {
-	existingCfg, err := config.Load()
+func initPassphraseOnly(ctx context.Context, keyPath, instance, claudeDir string) error {
+	existingCfg, err := config.LoadForInstance(instance, claudeDir)
 	if err != nil {
 		return fmt.Errorf("failed to load existing config: %w", err)
 	}
@@ -216,8 +266,9 @@ func initPassphraseOnly(ctx context.Context, keyPath string) error {
 }
 
 // initFullSetup handles the full init wizard
-func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile string, usePassphrase, force bool) error {
-	if config.Exists() && !force {
+func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile string, usePassphrase, force bool, instance, claudeDir string) error {
+	// Check if instance-specific config exists
+	if config.ExistsForInstance(instance) && !force {
 		var overwrite bool
 		prompt := &survey.Confirm{
 			Message: "Configuration already exists. Overwrite?",
@@ -285,7 +336,7 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 	printInfo("Files are encrypted with 'age' before upload.")
 	fmt.Println()
 
-	configDir := config.ConfigDirPath()
+	configDir := config.ConfigDirPathForInstance(instance)
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
@@ -394,9 +445,19 @@ skipKeyGen:
 	}
 
 	// Save config
+	keyPathRelative := "~/.claude-sync/age-key.txt"
+	if instance != "" {
+		keyPathRelative = "~/.claude-sync/" + instance + "/age-key.txt"
+	}
 	cfg := &config.Config{
 		Storage:       storageCfg,
-		EncryptionKey: "~/.claude-sync/age-key.txt",
+		EncryptionKey: keyPathRelative,
+		InstanceName:  instance,
+	}
+
+	// Set explicit claude dir override if provided
+	if claudeDir != "" {
+		cfg.ClaudeDirOverride = claudeDir
 	}
 
 	if err := config.Save(cfg); err != nil {
@@ -749,7 +810,8 @@ func pushCmd() *cobra.Command {
 		Short: "Upload local changes to cloud storage",
 		Long:  `Encrypt and upload changed files from ~/.claude to cloud storage.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}
@@ -864,7 +926,8 @@ Examples:
   claude-sync pull --dry-run    # Preview what would be changed
   claude-sync pull --force      # Skip confirmation prompts`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}
@@ -995,7 +1058,8 @@ func statusCmd() *cobra.Command {
 		Short: "Show pending local changes",
 		Long:  `Display files that have been added, modified, or deleted locally.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}
@@ -1073,7 +1137,8 @@ func diffCmd() *cobra.Command {
 		Short: "Show differences between local and remote",
 		Long:  `Compare local ~/.claude with remote cloud storage.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}
@@ -1164,7 +1229,18 @@ Examples:
   claude-sync conflicts --keep local # Keep all local versions
   claude-sync conflicts --keep remote # Keep all remote versions`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			claudeDir := config.ClaudeDir()
+			inst, explicitClaudeDir := resolveInstance()
+
+			// Determine claude dir
+			var claudeDir string
+			if explicitClaudeDir != "" {
+				claudeDir = explicitClaudeDir
+			} else if inst != "" {
+				home, _ := os.UserHomeDir()
+				claudeDir = filepath.Join(home, ".claude-"+inst)
+			} else {
+				claudeDir = config.ClaudeDir()
+			}
 
 			// Find all .conflict files
 			conflicts, err := findConflicts(claudeDir)
@@ -1450,6 +1526,7 @@ Examples:
   claude-sync reset --remote --local   # Full reset (nuclear option)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			reader := bufio.NewReader(os.Stdin)
+			inst, explicitClaudeDir := resolveInstance()
 
 			fmt.Println()
 			printWarning("This will reset claude-sync:")
@@ -1478,7 +1555,7 @@ Examples:
 			if clearRemote {
 				fmt.Printf("%s⋯%s Deleting remote files...\n", colorDim, colorReset)
 
-				cfg, err := config.Load()
+				cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 				if err != nil {
 					printWarning("Could not load config: " + err.Error())
 				} else {
@@ -1508,7 +1585,7 @@ Examples:
 
 			// Clear local state if requested
 			if clearLocal {
-				statePath := config.StateFilePath()
+				statePath := config.StateFilePathForInstance(inst)
 				if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
 					printWarning("Could not remove state file: " + err.Error())
 				} else {
@@ -1517,7 +1594,7 @@ Examples:
 			}
 
 			// Always clear config and key
-			configDir := config.ConfigDirPath()
+			configDir := config.ConfigDirPathForInstance(inst)
 			if err := os.RemoveAll(configDir); err != nil {
 				return fmt.Errorf("failed to remove config directory: %w", err)
 			}
@@ -2289,7 +2366,8 @@ func mcpListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List local MCP server configurations",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}
@@ -2333,7 +2411,8 @@ func mcpPushCmd() *cobra.Command {
 		Use:   "push",
 		Short: "Push MCP server configs to cloud storage",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}
@@ -2354,7 +2433,8 @@ func mcpPullCmd() *cobra.Command {
 		Use:   "pull",
 		Short: "Pull MCP server configs from cloud storage",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			inst, explicitClaudeDir := resolveInstance()
+			cfg, err := config.LoadForInstance(inst, explicitClaudeDir)
 			if err != nil {
 				return err
 			}

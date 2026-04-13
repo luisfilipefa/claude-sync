@@ -41,6 +41,9 @@ type Config struct {
 	// MCPSync enables syncing MCP server configs from ~/.claude.json
 	MCPSync bool `yaml:"mcp_sync,omitempty"`
 
+	// InstanceName is the instance identifier (not persisted, set at runtime)
+	InstanceName string `yaml:"-"`
+
 	// ClaudeDirOverride allows overriding the default ~/.claude path (for testing)
 	ClaudeDirOverride string `yaml:"-"`
 
@@ -66,23 +69,43 @@ var SyncPaths = []string{
 }
 
 func ConfigDirPath() string {
+	return ConfigDirPathForInstance("")
+}
+
+func ConfigDirPathForInstance(instance string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ConfigDir)
+	syncDir := filepath.Join(home, ConfigDir)
+	if instance == "" {
+		return syncDir
+	}
+	return filepath.Join(syncDir, instance)
 }
 
 func ConfigFilePath() string {
 	return filepath.Join(ConfigDirPath(), ConfigFile)
 }
 
+func ConfigFilePathForInstance(instance string) string {
+	return filepath.Join(ConfigDirPathForInstance(instance), ConfigFile)
+}
+
 func StateFilePath() string {
 	return filepath.Join(ConfigDirPath(), StateFile)
 }
 
+func StateFilePathForInstance(instance string) string {
+	return filepath.Join(ConfigDirPathForInstance(instance), StateFile)
+}
+
 func AgeKeyFilePath() string {
 	return filepath.Join(ConfigDirPath(), AgeKeyFile)
+}
+
+func AgeKeyFilePathForInstance(instance string) string {
+	return filepath.Join(ConfigDirPathForInstance(instance), AgeKeyFile)
 }
 
 func ClaudeDir() string {
@@ -103,7 +126,11 @@ func ClaudeJSONPath() string {
 }
 
 func Load() (*Config, error) {
-	configPath := ConfigFilePath()
+	return LoadForInstance("", "")
+}
+
+func LoadForInstance(instance, claudeDir string) (*Config, error) {
+	configPath := ConfigFilePathForInstance(instance)
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -116,6 +143,14 @@ func Load() (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Set instance name
+	cfg.InstanceName = instance
+
+	// Set claude dir override if provided
+	if claudeDir != "" {
+		cfg.ClaudeDirOverride = claudeDir
 	}
 
 	// Expand ~ in encryption key path
@@ -133,7 +168,7 @@ func Load() (*Config, error) {
 }
 
 func Save(cfg *Config) error {
-	configDir := ConfigDirPath()
+	configDir := ConfigDirPathForInstance(cfg.InstanceName)
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
@@ -143,7 +178,7 @@ func Save(cfg *Config) error {
 		return fmt.Errorf("failed to serialize config: %w", err)
 	}
 
-	configPath := ConfigFilePath()
+	configPath := ConfigFilePathForInstance(cfg.InstanceName)
 	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
@@ -152,7 +187,11 @@ func Save(cfg *Config) error {
 }
 
 func Exists() bool {
-	_, err := os.Stat(ConfigFilePath())
+	return ExistsForInstance("")
+}
+
+func ExistsForInstance(instance string) bool {
+	_, err := os.Stat(ConfigFilePathForInstance(instance))
 	return err == nil
 }
 

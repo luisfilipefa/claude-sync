@@ -68,12 +68,12 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 		return nil, fmt.Errorf("failed to create encryptor: %w", err)
 	}
 
-	// Use overridden state path if provided, otherwise use default
+	// Use overridden state path if provided, otherwise use instance-aware default
 	var state *SyncState
 	if cfg.StateDirOverride != "" {
 		state, err = LoadStateFromDir(cfg.StateDirOverride)
 	} else {
-		state, err = LoadState()
+		state, err = loadStateFromPath(config.StateFilePathForInstance(cfg.InstanceName))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to load state: %w", err)

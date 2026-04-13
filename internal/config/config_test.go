@@ -381,3 +381,223 @@ func TestIsExcluded(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigFilePathForInstance(t *testing.T) {
+	home := os.Getenv("HOME")
+
+	tests := []struct {
+		instance string
+		expected string
+	}{
+		{"", filepath.Join(home, ".claude-sync/config.yaml")},
+		{"alpha", filepath.Join(home, ".claude-sync/alpha/config.yaml")},
+		{"beta", filepath.Join(home, ".claude-sync/beta/config.yaml")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.instance, func(t *testing.T) {
+			result := ConfigFilePathForInstance(tt.instance)
+			if result != tt.expected {
+				t.Errorf("ConfigFilePathForInstance(%q) = %q, want %q", tt.instance, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExistsForInstance(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+
+	if ExistsForInstance("") {
+		t.Error("default instance should not exist initially")
+	}
+	if ExistsForInstance("alpha") {
+		t.Error("alpha instance should not exist initially")
+	}
+
+	// Create default instance config
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".claude-sync"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".claude-sync/config.yaml"), []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !ExistsForInstance("") {
+		t.Error("default instance should exist after creating config")
+	}
+	if ExistsForInstance("alpha") {
+		t.Error("alpha instance should still not exist")
+	}
+
+	// Create alpha instance config
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".claude-sync/alpha"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".claude-sync/alpha/config.yaml"), []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !ExistsForInstance("alpha") {
+		t.Error("alpha instance should exist after creating config")
+	}
+}
+
+func TestLoadForInstance(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+
+	instanceDir := filepath.Join(tmpDir, ".claude-sync/gamma")
+	if err := os.MkdirAll(instanceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	configData := `bucket: gamma-bucket
+account_id: gamma-account
+access_key_id: gamma-key
+secret_access_key: gamma-secret
+encryption_key_path: ~/.claude-sync/gamma/age-key.txt
+`
+	if err := os.WriteFile(filepath.Join(instanceDir, "config.yaml"), []byte(configData), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadForInstance("gamma", "")
+	if err != nil {
+		t.Fatalf("LoadForInstance failed: %v", err)
+	}
+	if cfg.InstanceName != "gamma" {
+		t.Errorf("InstanceName = %q, want %q", cfg.InstanceName, "gamma")
+	}
+	if cfg.Bucket != "gamma-bucket" {
+		t.Errorf("Bucket = %q, want %q", cfg.Bucket, "gamma-bucket")
+	}
+	if cfg.ClaudeDirOverride != "" {
+		t.Errorf("ClaudeDirOverride should be empty, got %q", cfg.ClaudeDirOverride)
+	}
+
+	// With explicit claude dir override
+	cfg2, err := LoadForInstance("gamma", "/custom/dir")
+	if err != nil {
+		t.Fatalf("LoadForInstance with claudeDir failed: %v", err)
+	}
+	if cfg2.ClaudeDirOverride != "/custom/dir" {
+		t.Errorf("ClaudeDirOverride = %q, want %q", cfg2.ClaudeDirOverride, "/custom/dir")
+	}
+
+	// Default instance should not find gamma config
+	_, err = LoadForInstance("", "")
+	if err == nil {
+		t.Error("LoadForInstance(\"\") should fail when no default config exists")
+	}
+}
+
+func TestSaveForInstance(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+
+	cfg := &Config{
+		Bucket:        "delta-bucket",
+		AccountID:     "delta-account",
+		EncryptionKey: "~/.claude-sync/delta/age-key.txt",
+		InstanceName:  "delta",
+	}
+
+	if err := Save(cfg); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	// Verify saved to instance-specific path
+	expectedPath := filepath.Join(tmpDir, ".claude-sync/delta/config.yaml")
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		t.Errorf("config not saved to instance path %q", expectedPath)
+	}
+
+	// Verify NOT saved to default path
+	defaultPath := filepath.Join(tmpDir, ".claude-sync/config.yaml")
+	if _, err := os.Stat(defaultPath); !os.IsNotExist(err) {
+		t.Error("config should not be saved to default path for named instance")
+	}
+
+	// Load back and verify round-trip
+	loaded, err := LoadForInstance("delta", "")
+	if err != nil {
+		t.Fatalf("LoadForInstance after Save failed: %v", err)
+	}
+	if loaded.Bucket != "delta-bucket" {
+		t.Errorf("Bucket = %q, want %q", loaded.Bucket, "delta-bucket")
+	}
+	if loaded.InstanceName != "delta" {
+		t.Errorf("InstanceName = %q, want %q", loaded.InstanceName, "delta")
+	}
+}
+
+func TestConfigDirPathForInstance(t *testing.T) {
+	home := os.Getenv("HOME")
+
+	tests := []struct {
+		instance string
+		expected string
+	}{
+		{"", filepath.Join(home, ".claude-sync")},
+		{"alpha", filepath.Join(home, ".claude-sync/alpha")},
+		{"beta", filepath.Join(home, ".claude-sync/beta")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.instance, func(t *testing.T) {
+			result := ConfigDirPathForInstance(tt.instance)
+			if result != tt.expected {
+				t.Errorf("ConfigDirPathForInstance(%q) = %q, want %q", tt.instance, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestStateFilePathForInstance(t *testing.T) {
+	home := os.Getenv("HOME")
+
+	tests := []struct {
+		instance string
+		expected string
+	}{
+		{"", filepath.Join(home, ".claude-sync/state.json")},
+		{"alpha", filepath.Join(home, ".claude-sync/alpha/state.json")},
+		{"beta", filepath.Join(home, ".claude-sync/beta/state.json")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.instance, func(t *testing.T) {
+			result := StateFilePathForInstance(tt.instance)
+			if result != tt.expected {
+				t.Errorf("StateFilePathForInstance(%q) = %q, want %q", tt.instance, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAgeKeyFilePathForInstance(t *testing.T) {
+	home := os.Getenv("HOME")
+
+	tests := []struct {
+		instance string
+		expected string
+	}{
+		{"", filepath.Join(home, ".claude-sync/age-key.txt")},
+		{"alpha", filepath.Join(home, ".claude-sync/alpha/age-key.txt")},
+		{"beta", filepath.Join(home, ".claude-sync/beta/age-key.txt")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.instance, func(t *testing.T) {
+			result := AgeKeyFilePathForInstance(tt.instance)
+			if result != tt.expected {
+				t.Errorf("AgeKeyFilePathForInstance(%q) = %q, want %q", tt.instance, result, tt.expected)
+			}
+		})
+	}
+}

@@ -459,3 +459,71 @@ func TestIsGzipped(t *testing.T) {
 		t.Error("gzip magic bytes should be detected as gzipped")
 	}
 }
+
+func TestInstanceStateIsolation(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create separate claude dirs and state dirs for two instances
+	defaultClaudeDir := filepath.Join(tmpDir, ".claude")
+	alphaClaudeDir := filepath.Join(tmpDir, ".claude-alpha")
+	defaultStateDir := filepath.Join(tmpDir, ".claude-sync")
+	alphaStateDir := filepath.Join(tmpDir, ".claude-sync/alpha")
+
+	for _, d := range []string{defaultClaudeDir, alphaClaudeDir, defaultStateDir, alphaStateDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := newMockStorage()
+	defaultEnc := testEncryptor(t, defaultStateDir)
+	alphaEnc := testEncryptor(t, alphaStateDir)
+
+	defaultState, err := LoadStateFromDir(defaultStateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaState, err := LoadStateFromDir(alphaStateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defaultSyncer := NewSyncerWith(&config.Config{}, store, defaultEnc, defaultState, defaultClaudeDir, true)
+	alphaSyncer := NewSyncerWith(&config.Config{}, store, alphaEnc, alphaState, alphaClaudeDir, true)
+
+	// Push a file from default instance
+	createTestFile(t, defaultClaudeDir, "settings.json", `{"instance": "default"}`)
+
+	ctx := context.Background()
+	if _, err := defaultSyncer.Push(ctx); err != nil {
+		t.Fatalf("default Push failed: %v", err)
+	}
+
+	// Default instance should have state; alpha should not
+	if !defaultSyncer.HasState() {
+		t.Error("default instance should have state after push")
+	}
+	if alphaSyncer.HasState() {
+		t.Error("alpha instance should have no state — state files are isolated")
+	}
+
+	// Alpha sees no local changes (its claude dir is empty)
+	alphaChanges, err := alphaSyncer.Status(ctx)
+	if err != nil {
+		t.Fatalf("alpha Status failed: %v", err)
+	}
+	if len(alphaChanges) != 0 {
+		t.Errorf("alpha instance should see no local changes, got %d", len(alphaChanges))
+	}
+
+	// Verify state files are written to separate paths
+	if err := defaultSyncer.GetState().Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(defaultStateDir, "state.json")); os.IsNotExist(err) {
+		t.Error("default state.json should exist")
+	}
+	if _, err := os.Stat(filepath.Join(alphaStateDir, "state.json")); !os.IsNotExist(err) {
+		t.Error("alpha state.json should not exist (alpha never saved)")
+	}
+}
