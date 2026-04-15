@@ -34,6 +34,7 @@ type Syncer struct {
 	quiet      bool
 	onProgress ProgressFunc
 	cfg        *config.Config
+	homeDir    string // local home dir for project path normalization (tech debt: replace with fingerprinting)
 }
 
 type SyncResult struct {
@@ -85,6 +86,8 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 		claudeDir = cfg.ClaudeDirOverride
 	}
 
+	homeDir, _ := os.UserHomeDir()
+
 	return &Syncer{
 		storage:   store,
 		encryptor: enc,
@@ -92,10 +95,12 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 		claudeDir: claudeDir,
 		quiet:     quiet,
 		cfg:       cfg,
+		homeDir:   homeDir,
 	}, nil
 }
 
 // NewSyncerWith creates a Syncer with pre-built dependencies (for testing).
+// homeDir defaults to "" (path normalization is a no-op) — use WithHomeDir to override.
 func NewSyncerWith(cfg *config.Config, store storage.Storage, enc *crypto.Encryptor, state *SyncState, claudeDir string, quiet bool) *Syncer {
 	return &Syncer{
 		storage:   store,
@@ -105,6 +110,13 @@ func NewSyncerWith(cfg *config.Config, store storage.Storage, enc *crypto.Encryp
 		quiet:     quiet,
 		cfg:       cfg,
 	}
+}
+
+// WithHomeDir overrides the home directory used for project path normalization.
+// Used in tests to inject a fake home dir without affecting existing test helpers.
+func (s *Syncer) WithHomeDir(h string) *Syncer {
+	s.homeDir = h
+	return s
 }
 
 func (s *Syncer) SetProgressFunc(fn ProgressFunc) {
@@ -458,13 +470,11 @@ func (s *Syncer) handleConflict(ctx context.Context, relativePath string, remote
 }
 
 func (s *Syncer) remoteKey(relativePath string) string {
-	// Add .age extension for encrypted files
-	return relativePath + ".age"
+	return encodeProjectPath(relativePath, s.homeDir) + ".age"
 }
 
 func (s *Syncer) localPath(remoteKey string) string {
-	// Remove .age extension
-	return strings.TrimSuffix(remoteKey, ".age")
+	return decodeProjectPath(strings.TrimSuffix(remoteKey, ".age"), s.homeDir)
 }
 
 func (s *Syncer) GetState() *SyncState {

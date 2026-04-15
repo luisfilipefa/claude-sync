@@ -66,6 +66,7 @@ func main() {
 		updateCmd(),
 		changelogCmd(),
 		mcpCmd(),
+		migratePathsCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -2429,4 +2430,150 @@ func runMCPPull(ctx context.Context, syncer *sync.Syncer) error {
 		}
 	}
 	return nil
+}
+
+func migratePathsCmd() *cobra.Command {
+	var dryRun, force bool
+	var fromHome string
+
+	cmd := &cobra.Command{
+		Use:   "migrate-paths",
+		Short: "Migrate project keys in remote storage to portable ~HOME~ encoding",
+		Long: `Re-upload project session keys from machine-specific absolute paths to the
+portable ~HOME~ encoding introduced for cross-OS sync.
+
+Run this once to enable cross-OS session continuity. By default, keys matching
+the current machine's home directory are migrated. Use --from-home to migrate
+keys pushed from a different machine (e.g. run on macOS to migrate Linux keys).
+
+  Before: projects/-home-alice-code-foo/sessions/abc.jsonl.age
+  After:  projects/~HOME~-code-foo/sessions/abc.jsonl.age
+
+Examples:
+  claude-sync migrate-paths --dry-run                       # Preview without making changes
+  claude-sync migrate-paths --from-home /home/alice         # Migrate keys pushed from Linux
+  claude-sync migrate-paths --force                         # Run without confirmation prompt`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+
+			if !quiet {
+				syncer.SetProgressFunc(func(event sync.ProgressEvent) {
+					if event.Error != nil {
+						fmt.Printf("\r%s✗%s %s: %v\n", colorYellow, colorReset, event.Path, event.Error)
+						return
+					}
+
+					switch event.Action {
+					case "scan":
+						fmt.Printf("%s⋯%s %s\n", colorDim, colorReset, event.Path)
+					case "migrate":
+						if event.Complete {
+							// Final newline after progress
+						} else {
+							progress := fmt.Sprintf("[%d/%d]", event.Current, event.Total)
+							shortPath := util.TruncatePath(event.Path, 50)
+							fmt.Printf("\r%s↻%s %s%s%s %s%s",
+								colorCyan, colorReset,
+								colorDim, progress, colorReset,
+								shortPath,
+								strings.Repeat(" ", 10))
+						}
+					}
+				})
+			}
+
+			ctx := context.Background()
+
+			// Always do a dry-run first to show the user what will change
+			preview, err := syncer.MigrateProjectPaths(ctx, true, fromHome)
+			if err != nil {
+				return fmt.Errorf("failed to scan remote storage: %w", err)
+			}
+
+			fmt.Println()
+			if len(preview.Migrated) == 0 {
+				fmt.Printf("%s✓%s Nothing to migrate\n", colorGreen, colorReset)
+				if preview.AlreadyNormalized > 0 {
+					fmt.Printf("  %s%d already using ~HOME~ encoding%s\n", colorDim, preview.AlreadyNormalized, colorReset)
+				}
+				if preview.DifferentHome > 0 {
+					fmt.Printf("  %s%d key(s) have a different home prefix — use --from-home to migrate them%s\n",
+						colorYellow, preview.DifferentHome, colorReset)
+				}
+				return nil
+			}
+
+			fmt.Printf("%s%d project key(s) to migrate:%s\n", colorBold, len(preview.Migrated), colorReset)
+			for _, mp := range preview.Migrated {
+				fmt.Printf("  %s%s%s\n    %s→%s %s\n",
+					colorDim, mp.OldKey, colorReset,
+					colorCyan, colorReset, mp.NewKey)
+			}
+			if preview.AlreadyNormalized > 0 {
+				fmt.Printf("  %s%d already using ~HOME~, skipped%s\n", colorDim, preview.AlreadyNormalized, colorReset)
+			}
+			if preview.DifferentHome > 0 {
+				fmt.Printf("  %s%d key(s) have a different home prefix, skipped (use --from-home)%s\n",
+					colorDim, preview.DifferentHome, colorReset)
+			}
+			fmt.Println()
+
+			if dryRun {
+				fmt.Printf("%s(dry-run — no changes made)%s\n", colorDim, colorReset)
+				return nil
+			}
+
+			if !force {
+				reader := bufio.NewReader(os.Stdin)
+				fmt.Printf("%sType 'migrate' to confirm:%s ", colorYellow, colorReset)
+				confirm, _ := reader.ReadString('\n')
+				if strings.TrimSpace(confirm) != "migrate" {
+					fmt.Println("Aborted.")
+					return nil
+				}
+				fmt.Println()
+			}
+
+			result, err := syncer.MigrateProjectPaths(ctx, false, fromHome)
+			if err != nil {
+				return fmt.Errorf("migration failed: %w", err)
+			}
+
+			if !quiet {
+				fmt.Println() // Clear the progress line
+			}
+
+			if len(result.Migrated) > 0 {
+				fmt.Printf("%s✓%s Migration complete: %s%d key(s) migrated%s",
+					colorGreen, colorReset,
+					colorBold, len(result.Migrated), colorReset)
+				if len(result.Errors) > 0 {
+					fmt.Printf(", %s%d error(s)%s", colorYellow, len(result.Errors), colorReset)
+				}
+				fmt.Println()
+			}
+			if len(result.Errors) > 0 {
+				fmt.Printf("\n%sErrors:%s\n", colorYellow, colorReset)
+				for _, e := range result.Errors {
+					fmt.Printf("  %s•%s %v\n", colorYellow, colorReset, e)
+				}
+				// Don't fail on errors — keys were successfully migrated, some cleanup failed
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview what would be migrated without making changes")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Skip confirmation prompt")
+	cmd.Flags().StringVar(&fromHome, "from-home", "", "Source home directory to migrate from (e.g. /home/alice for Linux keys)")
+	return cmd
 }
